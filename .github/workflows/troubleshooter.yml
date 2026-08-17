@@ -1,0 +1,287 @@
+name: Network Connectivity Monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SERVICE_URL: "https://api.trust.tools.sap/auth?pipeline_id=newtork-diagnostic&group_id=group"
+  CONNECT_TIMEOUT: 10
+  MAX_TIME: 30
+
+jobs:
+  connectivity-check:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check available network tools
+        run: |
+          echo "========================================"
+          echo "AVAILABLE NETWORK TOOLS"
+          echo "========================================"
+
+          for tool in curl ss ip nslookup dig tracepath netstat; do
+            if command -v "$tool" >/dev/null 2>&1; then
+              echo "✓ $tool: $(command -v "$tool")"
+            else
+              echo "✗ $tool: NOT INSTALLED"
+            fi
+          done
+
+      - name: Create diagnostics directory
+        run: |
+          mkdir -p diagnostics
+
+      - name: Collect environment information
+        run: |
+          {
+            echo "========================================"
+            echo "ENVIRONMENT INFORMATION"
+            echo "========================================"
+
+            echo
+            echo "===== TIMESTAMP ====="
+            date -u
+
+            echo
+            echo "===== HOSTNAME ====="
+            hostname
+
+            echo
+            echo "===== KERNEL ====="
+            uname -a
+
+            echo
+            echo "===== IP ADDRESSES ====="
+            ip addr || true
+
+            echo
+            echo "===== ROUTES ====="
+            ip route || true
+
+            echo
+            echo "===== DNS CONFIGURATION ====="
+            cat /etc/resolv.conf || true
+
+          } | tee diagnostics/environment.txt
+
+      - name: Resolve service hostname
+        id: dns
+        shell: bash
+        run: |
+          HOST=$(echo "$SERVICE_URL" | awk -F/ '{print $3}')
+
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "========================================"
+            echo "DNS RESOLUTION"
+            echo "========================================"
+
+            echo
+            echo "Hostname:"
+            echo "$HOST"
+
+            echo
+            echo "===== GETENT ====="
+            getent hosts "$HOST" || true
+
+            echo
+            echo "===== NSLOOKUP ====="
+            nslookup "$HOST" || true
+
+            echo
+            echo "===== DIG ====="
+            dig "$HOST" || true
+
+          } | tee diagnostics/dns.txt
+          
+      - name: Collect network diagnostics
+        shell: bash
+        run: |
+          HOST="${{ steps.dns.outputs.host }}"
+
+          {
+            echo "========================================"
+            echo "NETWORK DIAGNOSTICS"
+            echo "========================================"
+
+            echo
+            echo "===== TCP CONNECTIONS ====="
+            ss -tan || true
+
+            echo
+            echo "===== SOCKET STATISTICS ====="
+            ss -s || true
+
+            echo
+            echo "===== NETSTAT NETWORK STATISTICS ====="
+            netstat -s || true
+
+            echo
+            echo "===== ROUTING TABLE ====="
+            ip route || true
+
+            echo
+            echo "===== NEIGHBOUR TABLE ====="
+            ip neigh || true
+
+            echo
+            echo "===== TRACEPATH ====="
+            echo "Destination: $HOST"
+            tracepath -n "$HOST" || true
+
+          } | tee diagnostics/network.txt
+
+      - name: TCP connectivity test
+        id: tcp
+        shell: bash
+        run: |
+          HOST="${{ steps.dns.outputs.host }}"
+
+          echo "========================================"
+          echo "TCP CONNECTIVITY TEST"
+          echo "========================================"
+          echo "Destination: $HOST:443"
+          echo "Timeout: ${CONNECT_TIMEOUT}s"
+          echo
+
+          set +e
+
+          START=$(date +%s%N)
+
+          timeout "${CONNECT_TIMEOUT}" \
+            bash -c "</dev/tcp/$HOST/443"
+
+          rc=$?
+
+          END=$(date +%s%N)
+
+          DURATION=$(awk "BEGIN {printf \"%.3f\", ($END - $START) / 1000000000}")
+
+          echo "TCP connection duration: ${DURATION}s"
+          echo "TCP exit code: $rc"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+            echo "✅ TCP CONNECTION SUCCESSFUL"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+            echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+            echo "❌ TCP CONNECTION FAILED"
+          fi
+
+      - name: HTTPS connectivity test
+        id: https
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "HTTPS CONNECTIVITY TEST"
+          echo "========================================"
+          echo "URL: $SERVICE_URL"
+          echo
+
+          set +e
+
+          curl \
+            --verbose \
+            --connect-timeout "${CONNECT_TIMEOUT}" \
+            --max-time "${MAX_TIME}" \
+            --output /dev/null \
+            --write-out "\nDNS=%{time_namelookup}\nCONNECT=%{time_connect}\nTLS=%{time_appconnect}\nTTFB=%{time_starttransfer}\nTOTAL=%{time_total}\nHTTP=%{http_code}\nREMOTE_IP=%{remote_ip}\nREMOTE_PORT=%{remote_port}\n" \
+            "$SERVICE_URL" \
+            2>&1 | tee diagnostics/curl.log
+
+          rc=${PIPESTATUS[0]}
+
+          echo
+          echo "curl exit code: $rc"
+
+          if [ "$rc" -eq 0 ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            echo "✅ HTTPS REQUEST COMPLETED"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+            echo "❌ HTTPS REQUEST FAILED"
+          fi
+
+      - name: Create diagnostic summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "========================================"
+            echo "CONNECTIVITY MONITOR SUMMARY"
+            echo "========================================"
+
+            echo
+            echo "Timestamp:"
+            date -u
+
+            echo
+            echo "Runner:"
+            hostname
+
+            echo
+            echo "Service:"
+            echo "$SERVICE_URL"
+
+            echo
+            echo "===== RESULTS ====="
+
+            echo "DNS:"
+            echo "  Host: ${{ steps.dns.outputs.host }}"
+
+            echo
+            echo "TCP:"
+            echo "  Result: ${{ steps.tcp.outputs.result }}"
+            echo "  Duration: ${{ steps.tcp.outputs.duration }}s"
+
+            echo
+            echo "HTTPS:"
+            echo "  Result: ${{ steps.https.outputs.result }}"
+
+            echo
+            if [ "${{ steps.tcp.outputs.result }}" = "failure" ]; then
+              echo "DIAGNOSIS:"
+              echo "  TCP connection failed."
+              echo "  The runner could not establish a TCP connection to the service."
+              echo "  Investigate network path, firewall, routing, load balancer, or service endpoint."
+            elif [ "${{ steps.https.outputs.result }}" = "failure" ]; then
+              echo "DIAGNOSIS:"
+              echo "  TCP connection succeeded but HTTPS request failed."
+              echo "  Investigate TLS, HTTP, proxy, load balancer, or application behavior."
+            else
+              echo "DIAGNOSIS:"
+              echo "  Connectivity test passed."
+            fi
+
+          } | tee diagnostics/summary.txt
+
+      - name: Upload diagnostics
+        if: steps.tcp.outputs.result == 'failure' || steps.https.outputs.result == 'failure'
+        uses: actions/upload-artifact@v3
+        with:
+          name: connectivity-diagnostics-${{ github.run_number }}
+          path: diagnostics/
+
+      - name: Report connectivity failure
+        if: steps.tcp.outputs.result == 'failure' || steps.https.outputs.result == 'failure'
+        run: |
+          echo ""
+          echo "========================================"
+          echo "🚨 CONNECTIVITY FAILURE DETECTED"
+          echo "========================================"
+          echo "Service: $SERVICE_URL"
+          echo "Run: ${{ github.run_number }}"
+          echo ""
+          echo "Diagnostic artifact:"
+          echo "connectivity-diagnostics-${{ github.run_number }}"
+          echo "========================================"
+
+          exit 1
