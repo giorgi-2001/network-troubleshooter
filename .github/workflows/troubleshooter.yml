@@ -265,10 +265,11 @@ jobs:
 
       - name: Upload diagnostics
         if: steps.tcp.outputs.result == 'failure' || steps.https.outputs.result == 'failure'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: connectivity-diagnostics-${{ github.run_number }}
           path: diagnostics/
+          retention-days: 7
 
       - name: Report connectivity failure
         if: steps.tcp.outputs.result == 'failure' || steps.https.outputs.result == 'failure'
